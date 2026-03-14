@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
+OPENROUTER_BULK_MODEL_ENV = "OPENROUTER_BULK_MODEL"
+OPENROUTER_SYNTH_MODEL_ENV = "OPENROUTER_SYNTH_MODEL"
 
 
 @dataclass
@@ -68,8 +70,10 @@ class SemanticistAgent:
         self.repo_path = Path(repo_path).resolve()
         self.module_graph = module_graph
         self.lineage_graph = lineage_graph
-        self.bulk_model = bulk_model
-        self.synth_model = synth_model
+        # Allow overriding model names via environment so configuration
+        # lives alongside the API key rather than in code.
+        self.bulk_model = os.getenv(OPENROUTER_BULK_MODEL_ENV, bulk_model)
+        self.synth_model = os.getenv(OPENROUTER_SYNTH_MODEL_ENV, synth_model)
         self.budget = ContextWindowBudget(max_tokens=max_tokens)
 
         self.api_key = os.getenv(OPENROUTER_API_KEY_ENV)
@@ -102,8 +106,9 @@ class SemanticistAgent:
 
         logger.info("Semanticist: (optional) synthesizing Day-One answers …")
         # Day-One answers are written to CODEBASE.md / onboarding_brief
-        # by the Archivist; here we only prepare structured context.
+        # by the Archivist; here we prepare structured context + answers.
         self._prepare_day_one_context()
+        self._answer_day_one_questions()
 
     # ------------------------------------------------------------------ #
     # Purpose statements
@@ -262,4 +267,93 @@ class SemanticistAgent:
         }
         # Store under graph-level attribute for Archivist to read.
         self.lineage_graph.graph.graph["semantic_summary"] = summary
+
+    # ------------------------------------------------------------------ #
+    # Day-One question answering
+    # ------------------------------------------------------------------ #
+
+    def _answer_day_one_questions(self) -> None:
+        """Use the synth model to propose answers to the Five Day-One Questions.
+
+        The result is stored on the lineage graph as JSON so the Archivist
+        can use it when generating onboarding_brief.md.
+        """
+        if not self.lineage_graph or not self.module_graph:
+            return
+
+        # Build a compact structural summary as context.
+        summary = self.lineage_graph.graph.graph.get("semantic_summary", {})
+        pr = {}
+        for nid, data in self.module_graph.graph.nodes(data=True):
+            if data.get("node_type") == "ModuleNode":
+                pr[nid] = data.get("pagerank", 0.0)
+        top_modules = sorted(pr.items(), key=lambda x: x[1], reverse=True)[:10]
+
+        datasets_sources = []
+        datasets_sinks = []
+        for nid, data in self.lineage_graph.graph.nodes(data=True):
+            if data.get("node_type") != "DatasetNode":
+                continue
+            indeg = self.lineage_graph.graph.in_degree(nid)
+            outdeg = self.lineage_graph.graph.out_degree(nid)
+            if indeg == 0:
+                datasets_sources.append(nid)
+            if outdeg == 0:
+                datasets_sinks.append(nid)
+
+        context_obj = {
+            "summary": summary,
+            "top_modules_by_pagerank": top_modules,
+            "data_sources": datasets_sources[:50],
+            "data_sinks": datasets_sinks[:50],
+        }
+
+        if not self.budget.consume(json.dumps(context_obj)):
+            logger.info("Semanticist: budget exhausted before Day-One Q&A.")
+            return
+
+        prompt = (
+            "You are an experienced Forward-Deployed Engineer onboarding to a data platform.\n"
+            "You are given a structural summary of a codebase (modules with PageRank-based\n"
+            "importance, and datasets with sources/sinks). Based on this, answer the\n"
+            "Five FDE Day-One Questions:\n"
+            "1) Primary data ingestion path.\n"
+            "2) 3–5 most critical output datasets/endpoints.\n"
+            "3) Blast radius if the most critical module fails.\n"
+            "4) Where business logic is concentrated vs distributed.\n"
+            "5) What has changed most frequently in the last 90 days (qualitative guess\n"
+            "   if precise git data is missing).\n\n"
+            "Respond as STRICT JSON with the following shape:\n"
+            "{\n"
+            '  \"primary_ingestion_path\": \"...\",\n'
+            '  \"critical_outputs\": \"...\",\n'
+            '  \"blast_radius\": \"...\",\n'
+            '  \"logic_distribution\": \"...\",\n'
+            '  \"change_velocity\": \"...\",\n'
+            '  \"notes\": \"...optional extra observations...\"\n'
+            "}\n\n"
+            "Here is the context object:\n"
+            f"{json.dumps(context_obj, ensure_ascii=False)}"
+        )
+
+        try:
+            resp = completion(
+                model=self.synth_model,
+                messages=[
+                    {"role": "system", "content": "You produce ONLY strict JSON as described."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=512,
+            )
+            content = resp["choices"][0]["message"]["content"].strip()
+            answers = json.loads(content)
+        except Exception as exc:
+            logger.warning("Semanticist: Day-One Q&A synthesis failed: %s", exc)
+            return
+
+        if not isinstance(answers, dict):
+            logger.warning("Semanticist: Day-One answers not a dict, skipping.")
+            return
+
+        self.lineage_graph.graph.graph["day_one_answers"] = answers
 

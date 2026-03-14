@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.logging import RichHandler
 
@@ -20,6 +21,10 @@ console = Console()
 
 
 def _setup_logging(verbose: bool = False) -> None:
+    # Load environment variables from `.env` if present so that
+    # OPENROUTER_* settings are available for Semanticist/Navigator.
+    load_dotenv()
+
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -34,6 +39,7 @@ def analyze(
     repo: str = typer.Argument(..., help="Path to a local repo or a GitHub URL"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output directory (default: <repo>/.cartography)"),
     skip_llm: bool = typer.Option(False, "--skip-llm", help="Skip LLM-powered analysis (Phases 3-4)"),
+    incremental: bool = typer.Option(False, "--incremental", help="Incremental mode: only re-analyse files changed since last run"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
 ) -> None:
     """Run the full Cartographer analysis pipeline on a repository."""
@@ -41,7 +47,7 @@ def analyze(
 
     from src.orchestrator import Orchestrator
 
-    orch = Orchestrator(repo_input=repo, output_dir=output)
+    orch = Orchestrator(repo_input=repo, output_dir=output, incremental=incremental)
 
     if skip_llm:
         orch.run_interim_pipeline()

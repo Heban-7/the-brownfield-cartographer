@@ -46,11 +46,12 @@ def _should_skip(path: Path) -> bool:
 class HydrologistAgent:
     """Builds the data lineage graph for a repository."""
 
-    def __init__(self, repo_path: str | Path):
+    def __init__(self, repo_path: str | Path, changed_files: Optional[list[Path]] = None):
         self.repo_path = Path(repo_path).resolve()
         self.kg = KnowledgeGraph()
         self.datasets: dict[str, DatasetNode] = {}
         self.transformations: list[TransformationNode] = []
+        self._changed_files = changed_files
 
     def run(self) -> KnowledgeGraph:
         """Execute the full lineage analysis pipeline."""
@@ -83,6 +84,10 @@ class HydrologistAgent:
     # ------------------------------------------------------------------
 
     def _collect_files(self) -> list[Path]:
+        if self._changed_files:
+            logger.info("Hydrologist: incremental mode, %d changed file(s)", len(self._changed_files))
+            return sorted(self._changed_files)
+
         files: list[Path] = []
         for p in self.repo_path.rglob("*"):
             if not p.is_file():

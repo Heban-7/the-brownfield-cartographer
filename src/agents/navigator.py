@@ -15,6 +15,7 @@ the CLI (`cartographer query <repo>`).
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -26,6 +27,9 @@ from src.graph.knowledge_graph import KnowledgeGraph
 
 logger = logging.getLogger(__name__)
 console = Console()
+
+OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
+OPENROUTER_EXPLAIN_MODEL_ENV = "OPENROUTER_EXPLAIN_MODEL"
 
 
 class NavigatorAgent:
@@ -186,7 +190,7 @@ class NavigatorAgent:
         console.print(f"[bold]Module:[/] {nid}")
         console.print(f"[bold]Purpose:[/] {purpose}")
 
-        api_key = os.getenv("OPENROUTER_API_KEY")
+        api_key = os.getenv(OPENROUTER_API_KEY_ENV)
         if not api_key:
             return  # Don't attempt online elaboration without a key.
 
@@ -200,8 +204,9 @@ class NavigatorAgent:
             context += f"\nExisting docstring:\n{doc}\n"
 
         try:
+            model_name = os.getenv(OPENROUTER_EXPLAIN_MODEL_ENV, "openrouter/openai/gpt-4o-mini")
             resp = completion(
-                model="openrouter/openai/gpt-4o-mini",
+                model=model_name,
                 messages=[
                     {"role": "system", "content": "You explain code modules to new engineers."},
                     {"role": "user", "content": f"Explain this module in 3–5 sentences:\n\n{context}"},

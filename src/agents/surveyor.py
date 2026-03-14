@@ -51,39 +51,25 @@ def _collect_files(repo_path: Path) -> list[Path]:
     return sorted(files)
 
 
-def _resolve_import(
-    import_name: str, module_path: Path, repo_path: Path
-) -> Optional[str]:
-    """Best-effort resolution of a Python import to a file in the repo."""
-    parts = import_name.replace(".", "/")
-    candidates = [
-        repo_path / f"{parts}.py",
-        repo_path / parts / "__init__.py",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            try:
-                rel = str(candidate.relative_to(repo_path))
-                return rel.replace("\\", "/")
-            except ValueError:
-                return str(candidate).replace("\\", "/")
-    return None
-
-
 class SurveyorAgent:
     """Analyses a repository and produces the module import graph."""
 
-    def __init__(self, repo_path: str | Path):
+    def __init__(self, repo_path: str | Path, changed_files: Optional[list[Path]] = None):
         self.repo_path = Path(repo_path).resolve()
         self.kg = KnowledgeGraph()
         self.module_nodes: dict[str, ModuleNode] = {}
         self.function_nodes: dict[str, FunctionNode] = {}
+        self._changed_files = changed_files
 
     def run(self) -> KnowledgeGraph:
         """Execute the full survey pipeline."""
         logger.info("Surveyor: scanning %s", self.repo_path)
 
-        files = _collect_files(self.repo_path)
+        if self._changed_files:
+            files = self._changed_files
+            logger.info("Surveyor: incremental mode, %d changed file(s)", len(files))
+        else:
+            files = _collect_files(self.repo_path)
         logger.info("Surveyor: found %d files to analyse", len(files))
 
         with Progress(
@@ -130,10 +116,31 @@ class SurveyorAgent:
                 self.kg.add_node(fid, fn, node_type="FunctionNode")
 
     def _build_import_edges(self) -> None:
+        """Create IMPORTS edges between ModuleNode entries.
+
+        Rather than guessing paths from imports and repo root (which breaks on
+        monorepos like Airflow), we resolve imports by matching their dotted
+        form against the *observed* module paths in the graph. This is a
+        best-effort heuristic but works well in practice.
+        """
+        module_paths = list(self.module_nodes.keys())
+        norm_paths = [p.replace("\\", "/") for p in module_paths]
+
         for rel, mod in self.module_nodes.items():
             for imp in mod.imports:
-                target = _resolve_import(imp, self.repo_path / rel, self.repo_path)
-                if target and target in self.module_nodes:
+                dotted = imp.strip()
+                if not dotted:
+                    continue
+                suffixes = [
+                    dotted.replace(".", "/") + ".py",
+                    dotted.replace(".", "/") + "/__init__.py",
+                ]
+                target: Optional[str] = None
+                for path, norm in zip(module_paths, norm_paths):
+                    if any(norm.endswith(sfx) for sfx in suffixes):
+                        target = path
+                        break
+                if target:
                     edge = ImportsEdge(source=rel, target=target, import_names=[imp])
                     self.kg.add_edge(rel, target, edge=edge, edge_type="IMPORTS")
 

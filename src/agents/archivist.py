@@ -55,6 +55,7 @@ class ArchivistAgent:
 
         arch_overview = self._architecture_overview()
         critical_path = self._critical_path_modules()
+        domain_overview = self._domain_overview()
         data_sources, data_sinks = self._data_sources_and_sinks()
         known_debt = self._known_debt()
         high_velocity = self._high_velocity_files()
@@ -75,6 +76,14 @@ class ArchivistAgent:
                 lines.append(f"- `{mod}` (PageRank={score:.4f})")
         else:
             lines.append("_No PageRank data available._")
+        lines.append("")
+        lines.append("## Domain Overview")
+        lines.append("")
+        if domain_overview:
+            for dom, count in domain_overview:
+                lines.append(f"- **{dom}**: {count} module(s)")
+        else:
+            lines.append("- _No domain clustering information available_")
         lines.append("")
         lines.append("## Data Sources & Sinks")
         lines.append("")
@@ -146,6 +155,18 @@ class ArchivistAgent:
             return []
         return sorted(pr.items(), key=lambda x: x[1], reverse=True)[:n]
 
+    def _domain_overview(self) -> list[tuple[str, int]]:
+        """Summarise how many modules fell into each inferred domain."""
+        if not self.module_graph:
+            return []
+        counts: dict[str, int] = {}
+        for _, data in self.module_graph.graph.nodes(data=True):
+            if data.get("node_type") != "ModuleNode":
+                continue
+            dom = data.get("domain_cluster") or "unassigned"
+            counts[dom] = counts.get(dom, 0) + 1
+        return sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+
     def _data_sources_and_sinks(self) -> tuple[list[str], list[str]]:
         if not self.lineage_graph:
             return [], []
@@ -212,24 +233,54 @@ class ArchivistAgent:
         lines.append("")
         lines.append("## The Five FDE Day-One Questions")
         lines.append("")
-        lines.append("### 1. What is the primary data ingestion path?")
-        lines.append("- _To be refined via Semanticist/Navigator; initial hints from data sources in `CODEBASE.md`._")
-        lines.append("")
-        lines.append("### 2. What are the 3–5 most critical output datasets/endpoints?")
-        lines.append("- _See Data Sinks section in `CODEBASE.md`; sort by business importance once known._")
-        lines.append("")
-        lines.append("### 3. What is the blast radius if the most critical module fails?")
-        lines.append("- _Use the `cartographer blast-radius` CLI on candidate modules/datasets._")
-        lines.append("")
-        lines.append("### 4. Where is the business logic concentrated vs. distributed?")
-        lines.append("- _Approximate via high PageRank modules and domain clusters (if Semanticist ran)._")
-        lines.append("")
-        lines.append("### 5. What has changed most frequently in the last 90 days?")
-        lines.append("- _See High-Velocity Files section in `CODEBASE.md`._")
-        lines.append("")
-        lines.append("> NOTE: This brief is a scaffold; for a full answer you will typically")
-        lines.append("> re-run the Semanticist with appropriate API keys and use the Navigator")
-        lines.append("> agent to cross-check answers against specific files and line ranges.")
+
+        answers = (
+            self.lineage_graph.graph.graph.get("day_one_answers")
+            if self.lineage_graph
+            else None
+        )
+
+        if isinstance(answers, dict):
+            lines.append("### 1. What is the primary data ingestion path?")
+            lines.append(answers.get("primary_ingestion_path", "_No answer produced._"))
+            lines.append("")
+            lines.append("### 2. What are the 3–5 most critical output datasets/endpoints?")
+            lines.append(answers.get("critical_outputs", "_No answer produced._"))
+            lines.append("")
+            lines.append("### 3. What is the blast radius if the most critical module fails?")
+            lines.append(answers.get("blast_radius", "_No answer produced._"))
+            lines.append("")
+            lines.append("### 4. Where is the business logic concentrated vs. distributed?")
+            lines.append(answers.get("logic_distribution", "_No answer produced._"))
+            lines.append("")
+            lines.append("### 5. What has changed most frequently in the last 90 days?")
+            lines.append(answers.get("change_velocity", "_No answer produced._"))
+            lines.append("")
+            notes = answers.get("notes")
+            if notes:
+                lines.append("### Additional Notes")
+                lines.append(notes)
+                lines.append("")
+        else:
+            # Fallback scaffold if Semanticist/LLM did not run.
+            lines.append("### 1. What is the primary data ingestion path?")
+            lines.append("- _To be refined via Semanticist/Navigator; initial hints from data sources in `CODEBASE.md`._")
+            lines.append("")
+            lines.append("### 2. What are the 3–5 most critical output datasets/endpoints?")
+            lines.append("- _See Data Sinks section in `CODEBASE.md`; sort by business importance once known._")
+            lines.append("")
+            lines.append("### 3. What is the blast radius if the most critical module fails?")
+            lines.append("- _Use the `cartographer blast-radius` CLI on candidate modules/datasets._")
+            lines.append("")
+            lines.append("### 4. Where is the business logic concentrated vs. distributed?")
+            lines.append("- _Approximate via high PageRank modules and domain clusters (if Semanticist ran)._")
+            lines.append("")
+            lines.append("### 5. What has changed most frequently in the last 90 days?")
+            lines.append("- _See High-Velocity Files section in `CODEBASE.md`._")
+            lines.append("")
+            lines.append("> NOTE: This brief is a scaffold; for a full answer you will typically")
+            lines.append("> re-run the Semanticist with appropriate API keys and use the Navigator")
+            lines.append("> agent to cross-check answers against specific files and line ranges.")
 
         path.write_text("\n".join(lines), encoding="utf-8")
         logger.info("Archivist: wrote %s", path)

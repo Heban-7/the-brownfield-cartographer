@@ -17,6 +17,7 @@ from rich.panel import Panel
 
 from src.agents.surveyor import SurveyorAgent
 from src.agents.hydrologist import HydrologistAgent
+from src.analyzers.git_analyzer import get_changed_files_since
 from src.graph.knowledge_graph import KnowledgeGraph
 
 logger = logging.getLogger(__name__)
@@ -73,10 +74,10 @@ class Orchestrator:
     # Pipeline stages
     # ------------------------------------------------------------------
 
-    def run_survey(self) -> KnowledgeGraph:
+    def run_survey(self, changed_files: Optional[list[Path]] = None) -> KnowledgeGraph:
         console.print(Panel("[bold]Stage 1/4: Surveyor Agent[/] — Static Structure Analysis"))
         start = time.time()
-        surveyor = SurveyorAgent(self.repo_path)
+        surveyor = SurveyorAgent(self.repo_path, changed_files=changed_files)
         self.module_graph = surveyor.run()
         elapsed = time.time() - start
 
@@ -90,7 +91,7 @@ class Orchestrator:
 
         circular = surveyor.circular_dependency_groups()
         if circular:
-            console.print(f"[yellow]⚠ {len(circular)} circular dependency group(s) detected[/]")
+            console.print(f"[yellow]WARNING: {len(circular)} circular dependency group(s) detected[/]")
 
         dead = surveyor.dead_code_candidates()
         if dead:
@@ -98,10 +99,10 @@ class Orchestrator:
 
         return self.module_graph
 
-    def run_hydrology(self) -> KnowledgeGraph:
+    def run_hydrology(self, changed_files: Optional[list[Path]] = None) -> KnowledgeGraph:
         console.print(Panel("[bold]Stage 2/4: Hydrologist Agent[/] — Data Lineage Analysis"))
         start = time.time()
-        hydro = HydrologistAgent(self.repo_path)
+        hydro = HydrologistAgent(self.repo_path, changed_files=changed_files)
         self.lineage_graph = hydro.run()
         elapsed = time.time() - start
 
@@ -203,8 +204,10 @@ class Orchestrator:
         )
         start = time.time()
 
-        self.run_survey()
-        self.run_hydrology()
+        changed_files = self._compute_changed_files() if self.incremental else None
+
+        self.run_survey(changed_files=changed_files)
+        self.run_hydrology(changed_files=changed_files)
 
         if not skip_llm:
             self.run_semanticist()
@@ -227,9 +230,40 @@ class Orchestrator:
         )
         start = time.time()
 
-        self.run_survey()
-        self.run_hydrology()
+        changed_files = self._compute_changed_files() if self.incremental else None
+
+        self.run_survey(changed_files=changed_files)
+        self.run_hydrology(changed_files=changed_files)
         self._save_outputs()
 
         elapsed = time.time() - start
         console.print(f"\n[bold]Total analysis time: {elapsed:.1f}s[/]")
+
+    # ------------------------------------------------------------------
+    # Incremental helpers
+    # ------------------------------------------------------------------
+
+    def _compute_changed_files(self) -> Optional[list[Path]]:
+        """Return a list of Paths that changed since the last analysis, if possible."""
+        meta_path = self.output_dir / "meta.json"
+        if not meta_path.exists():
+            return None
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            ts_str = meta.get("timestamp")
+            if not ts_str:
+                return None
+            ts = datetime.fromisoformat(ts_str)
+        except Exception as exc:
+            logger.warning("Orchestrator: could not read meta.json for incremental mode: %s", exc)
+            return None
+
+        changed = get_changed_files_since(self.repo_path, ts)
+        if not changed:
+            console.print("[dim]Incremental mode: no changed files detected; falling back to full scan.[/]")
+            return None
+
+        console.print(f"[bold]Incremental mode:[/] {len(changed)} changed file(s) since last run.")
+        paths = [self.repo_path / p for p in changed]
+        return paths
