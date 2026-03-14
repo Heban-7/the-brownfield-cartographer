@@ -44,6 +44,8 @@ class ModuleNode(BaseModel):
     domain_cluster: str = ""
     complexity_score: float = 0.0
     lines_of_code: int = 0
+    line_start: int = 1
+    line_end: int = 0
     comment_ratio: float = 0.0
     change_velocity_30d: int = 0
     is_dead_code_candidate: bool = False

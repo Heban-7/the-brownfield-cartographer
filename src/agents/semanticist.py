@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from litellm import completion, embedding
 
 from src.graph.knowledge_graph import KnowledgeGraph
+from src.graph.semantic_index import SemanticIndex
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 OPENROUTER_BULK_MODEL_ENV = "OPENROUTER_BULK_MODEL"
 OPENROUTER_SYNTH_MODEL_ENV = "OPENROUTER_SYNTH_MODEL"
+OPENROUTER_EMBED_MODEL_ENV = "OPENROUTER_EMBED_MODEL"
 
 
 @dataclass
@@ -74,6 +76,7 @@ class SemanticistAgent:
         # lives alongside the API key rather than in code.
         self.bulk_model = os.getenv(OPENROUTER_BULK_MODEL_ENV, bulk_model)
         self.synth_model = os.getenv(OPENROUTER_SYNTH_MODEL_ENV, synth_model)
+        self.embed_model = os.getenv(OPENROUTER_EMBED_MODEL_ENV, "openrouter/openai/text-embedding-3-small")
         self.budget = ContextWindowBudget(max_tokens=max_tokens)
 
         self.api_key = os.getenv(OPENROUTER_API_KEY_ENV)
@@ -103,6 +106,9 @@ class SemanticistAgent:
 
         logger.info("Semanticist: clustering modules into domains …")
         self._cluster_into_domains()
+
+        logger.info("Semanticist: building semantic index …")
+        self._build_semantic_index()
 
         logger.info("Semanticist: (optional) synthesizing Day-One answers …")
         # Day-One answers are written to CODEBASE.md / onboarding_brief
@@ -158,8 +164,34 @@ class SemanticistAgent:
             drift_flag = bool(existing_doc and existing_doc.strip() and existing_doc.strip()[:80] not in summary)
 
             self.module_graph.graph.nodes[nid]["purpose_statement"] = summary
-            if drift_flag:
-                self.module_graph.graph.nodes[nid]["doc_drift"] = True
+            self._annotate_doc_drift(nid, existing_doc, summary)
+
+    def _annotate_doc_drift(self, node_id: str, docstring: str, purpose: str) -> None:
+        """Compute a simple drift severity between docstring and purpose."""
+        doc = (docstring or "").lower().split()
+        purp = (purpose or "").lower().split()
+        if not doc or not purp:
+            self.module_graph.graph.nodes[node_id]["doc_drift_severity"] = "none"
+            self.module_graph.graph.nodes[node_id]["doc_drift"] = False
+            return
+
+        doc_set = set(doc)
+        purp_set = set(purp)
+        inter = len(doc_set & purp_set)
+        union = len(doc_set | purp_set) or 1
+        jaccard = inter / union
+
+        if jaccard >= 0.8:
+            sev = "none"
+        elif jaccard >= 0.6:
+            sev = "low"
+        elif jaccard >= 0.4:
+            sev = "medium"
+        else:
+            sev = "high"
+
+        self.module_graph.graph.nodes[node_id]["doc_drift_severity"] = sev
+        self.module_graph.graph.nodes[node_id]["doc_drift"] = sev in {"medium", "high"}
 
     @staticmethod
     def _build_purpose_prompt(module_path: str, code: str, docstring: str) -> str:
@@ -356,4 +388,51 @@ class SemanticistAgent:
             return
 
         self.lineage_graph.graph.graph["day_one_answers"] = answers
+
+    # ------------------------------------------------------------------ #
+    # Semantic index construction
+    # ------------------------------------------------------------------ #
+
+    def _build_semantic_index(self) -> None:
+        """Build a semantic index of modules for Navigator to query."""
+        if not self.module_graph:
+            return
+
+        base_dir = self.repo_path / ".cartography" / "semantic_index"
+        index = SemanticIndex(base_dir)
+        index.clear()
+
+        items: list[tuple[str, list[float], dict]] = []
+
+        for nid, data in self._iter_module_nodes():
+            path = data.get("path") or nid
+            purpose = (data.get("purpose_statement") or "").strip()
+            doc = (data.get("docstring") or "").strip()
+            # Construct a compact description to embed.
+            text = f"{path}\n\nPurpose:\n{purpose}\n\nDocstring:\n{doc}"
+            if not text.strip():
+                continue
+            try:
+                emb = embedding(
+                    model=self.embed_model,
+                    input=text,
+                )
+                vec = emb["data"][0]["embedding"]
+            except Exception as exc:
+                logger.warning("Semanticist: embedding failed for %s: %s", path, exc)
+                continue
+
+            items.append(
+                (
+                    nid,
+                    vec,
+                    {
+                        "path": path,
+                        "purpose_statement": purpose,
+                        "node_type": "ModuleNode",
+                    },
+                )
+            )
+
+        index.upsert_modules(items)
 

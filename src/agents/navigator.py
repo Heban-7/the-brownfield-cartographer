@@ -19,17 +19,19 @@ import os
 from pathlib import Path
 from typing import Literal, Optional
 
-from litellm import completion
+from litellm import completion, embedding
 from rich.console import Console
 from rich.prompt import Prompt
 
 from src.graph.knowledge_graph import KnowledgeGraph
+from src.graph.semantic_index import SemanticIndex
 
 logger = logging.getLogger(__name__)
 console = Console()
 
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 OPENROUTER_EXPLAIN_MODEL_ENV = "OPENROUTER_EXPLAIN_MODEL"
+OPENROUTER_EMBED_MODEL_ENV = "OPENROUTER_EMBED_MODEL"
 
 
 class NavigatorAgent:
@@ -48,6 +50,16 @@ class NavigatorAgent:
             self.kg = KnowledgeGraph.deserialize(self.module_graph_path)
         else:
             raise RuntimeError("No knowledge graph JSON found under .cartography/")
+
+        # Optional semantic index for vector-based search.
+        si_dir = self.cartography_dir / "semantic_index"
+        self.semantic_index: Optional[SemanticIndex] = None
+        if si_dir.exists():
+            try:
+                self.semantic_index = SemanticIndex(si_dir)
+            except Exception as exc:
+                logger.warning("Navigator: could not load semantic index: %s", exc)
+        self.embed_model = os.getenv(OPENROUTER_EMBED_MODEL_ENV, "openrouter/openai/text-embedding-3-small")
 
     # ------------------------------------------------------------------ #
     # Interactive loop
@@ -97,7 +109,9 @@ class NavigatorAgent:
                 path = " ".join(parts[1:])
                 self._cmd_explain_module(path)
             else:
-                console.print("[red]Unrecognized command.[/] Type 'help' for options.")
+                # Treat as a natural-language question and route heuristically.
+                question = cmd
+                self._route_question(question)
         except Exception as exc:
             logger.exception("Navigator command failed: %s", exc)
             console.print(f"[red]Error:[/] {exc}")
@@ -107,7 +121,35 @@ class NavigatorAgent:
     # ------------------------------------------------------------------ #
 
     def _cmd_find_implementation(self, concept: str) -> None:
-        """Very lightweight semantic search: scan purpose statements and docstrings."""
+        """Semantic search for implementation locations.
+
+        Prefer vector-based search over the semantic index; fall back to
+        substring search over purpose/docstring if no index is available.
+        """
+        # Vector-based search when index + embed model are available.
+        if self.semantic_index is not None:
+            try:
+                emb = embedding(model=self.embed_model, input=concept)
+                vec = emb["data"][0]["embedding"]
+                hits = self.semantic_index.query(vec, k=10)
+                if hits:
+                    console.print(f"[bold]Semantic matches for '{concept}' (vector search):[/]")
+                    for h in hits:
+                        mid = h["id"]
+                        meta = h.get("metadata") or {}
+                        path = meta.get("path", mid)
+                        dist = h.get("distance")
+                        evidence = self.kg.get_evidence(mid)
+                        loc = evidence.get("path") or path
+                        ls = evidence.get("line_start")
+                        le = evidence.get("line_end")
+                        loc_str = f"{loc}:{ls}-{le}" if ls and le else loc
+                        console.print(f"- {mid}  [dim]({loc_str}, dist={dist:.3f})[/]")
+                    return
+            except Exception as exc:
+                logger.warning("Navigator: vector search failed, falling back to substring: %s", exc)
+
+        # Fallback: substring search across module path + purpose + docstring.
         matches = []
         c_lower = concept.lower()
         for nid, data in self.kg.graph.nodes(data=True):
@@ -127,9 +169,14 @@ class NavigatorAgent:
             console.print(f"[yellow]No modules mentioning '{concept}'.[/]")
             return
 
-        console.print(f"[bold]Modules related to '{concept}':[/]")
+        console.print(f"[bold]Modules related to '{concept}' (substring search):[/]")
         for nid in matches[:20]:
-            console.print(f"- {nid}")
+            evidence = self.kg.get_evidence(nid)
+            path = evidence.get("path") or nid
+            ls = evidence.get("line_start")
+            le = evidence.get("line_end")
+            loc = f"{path}:{ls}-{le}" if ls and le else path
+            console.print(f"- {nid}  [dim]({loc})[/]")
 
     def _cmd_trace_lineage(self, dataset: str, direction: str) -> None:
         kg = self._load_lineage_graph()
@@ -152,7 +199,12 @@ class NavigatorAgent:
 
         console.print(f"[bold]{label.capitalize()} lineage for '{dataset}' ({len(nodes)} nodes):[/]")
         for nid in sorted(nodes):
-            console.print(f"- {nid}")
+            evidence = kg.get_evidence(nid)
+            path = evidence.get("path") or nid
+            ls = evidence.get("line_start")
+            le = evidence.get("line_end")
+            loc = f"{path}:{ls}-{le}" if ls and le else path
+            console.print(f"- {nid}  [dim]({loc})[/]")
 
     def _cmd_blast_radius(self, node: str) -> None:
         kg = self.kg
@@ -169,7 +221,12 @@ class NavigatorAgent:
         downstream = kg.bfs_downstream(start)
         console.print(f"[bold]Blast radius for '{node}': {len(downstream)} downstream node(s)[/]")
         for nid in sorted(downstream):
-            console.print(f"- {nid}")
+            evidence = kg.get_evidence(nid)
+            path = evidence.get("path") or nid
+            ls = evidence.get("line_start")
+            le = evidence.get("line_end")
+            loc = f"{path}:{ls}-{le}" if ls and le else path
+            console.print(f"- {nid}  [dim]({loc})[/]")
 
     def _cmd_explain_module(self, path: str) -> None:
         """Retrieve purpose statement + optional LLM elaboration."""
@@ -227,4 +284,27 @@ class NavigatorAgent:
         if self.lineage_graph_path.exists():
             return KnowledgeGraph.deserialize(self.lineage_graph_path)
         return self.kg
+
+    def _route_question(self, question: str) -> None:
+        """Very simple router for natural-language questions."""
+        q = question.lower()
+        # Lineage-style questions.
+        if any(word in q for word in ["upstream", "downstream", "feeds", "source of", "produces"]):
+            # Heuristic: try to extract a token that looks like a dataset name.
+            tokens = q.replace("?", " ").split()
+            if tokens:
+                candidate = tokens[-1]
+                self._cmd_trace_lineage(candidate, "downstream")
+                return
+
+        # Blast radius-style questions.
+        if "blast radius" in q or "what breaks if" in q:
+            tokens = q.replace("?", " ").split()
+            if tokens:
+                candidate = tokens[-1]
+                self._cmd_blast_radius(candidate)
+                return
+
+        # Otherwise, treat as concept search over modules.
+        self._cmd_find_implementation(question)
 

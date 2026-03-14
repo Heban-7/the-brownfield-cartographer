@@ -173,3 +173,49 @@ class KnowledgeGraph:
             "edge_types": edge_types,
             "strongly_connected_components": len(self.strongly_connected_components()),
         }
+
+    # ------------------------------------------------------------------
+    # Evidence helpers
+    # ------------------------------------------------------------------
+
+    def get_evidence(self, node_id: str) -> dict[str, Any]:
+        """Return basic evidence for a node: file path and line range if available."""
+        data = self.get_node(node_id) or {}
+        node_type = data.get("node_type")
+
+        if node_type == "ModuleNode":
+            return {
+                "path": data.get("path"),
+                "line_start": data.get("line_start", 1),
+                "line_end": data.get("line_end", data.get("lines_of_code", 0)),
+            }
+        if node_type == "FunctionNode":
+            return {
+                "path": data.get("parent_module"),
+                "line_start": data.get("line_start"),
+                "line_end": data.get("line_end"),
+            }
+        if node_type == "DatasetNode":
+            return {
+                "path": data.get("source_file"),
+                "line_start": data.get("line_number"),
+                "line_end": data.get("line_number"),
+            }
+        if node_type == "TransformationNode":
+            return {
+                "path": data.get("source_file"),
+                "line_start": data.get("line_start"),
+                "line_end": data.get("line_end"),
+            }
+        return {}
+
+    def get_edge_evidence(self, source: str, target: str) -> dict[str, Any]:
+        """Return evidence for an edge (usually data lineage edges)."""
+        if not self.graph.has_edge(source, target):
+            return {}
+        data = dict(self.graph.edges[source, target])
+        return {
+            "edge_type": data.get("edge_type"),
+            "source_file": data.get("source_file"),
+            "line_range": data.get("line_range"),
+        }
