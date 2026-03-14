@@ -15,11 +15,15 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from src.graph.knowledge_graph import KnowledgeGraph
 
 logger = logging.getLogger(__name__)
+
+
+def _noop_trace(agent: str, action: str, detail: str = "", confidence: str = "high") -> None:
+    pass
 
 
 class ArchivistAgent:
@@ -31,20 +35,27 @@ class ArchivistAgent:
         module_graph: Optional[KnowledgeGraph],
         lineage_graph: Optional[KnowledgeGraph],
         output_dir: str | Path,
+        trace_callback: Optional[Callable[[str, str, str, str], None]] = None,
     ) -> None:
         self.repo_path = Path(repo_path).resolve()
         self.module_graph = module_graph
         self.lineage_graph = lineage_graph
         self.output_dir = Path(output_dir)
+        self._trace = trace_callback or _noop_trace
+
+    def _log(self, action: str, detail: str = "", confidence: str = "high") -> None:
+        self._trace("archivist", action, detail, confidence)
 
     # ------------------------------------------------------------------ #
     # Public entry
     # ------------------------------------------------------------------ #
 
     def run(self) -> None:
+        self._log("start", f"output_dir={self.output_dir}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._write_codebase_md()
         self._write_onboarding_brief()
+        self._log("complete", "All artifacts generated")
 
     # ------------------------------------------------------------------ #
     # CODEBASE.md
@@ -52,13 +63,27 @@ class ArchivistAgent:
 
     def _write_codebase_md(self) -> None:
         path = self.output_dir / "CODEBASE.md"
+        self._log("codebase_md_start", f"target={path}")
 
         arch_overview = self._architecture_overview()
+        self._log("architecture_overview", arch_overview[:200] + "..." if len(arch_overview) > 200 else arch_overview)
+
         critical_path = self._critical_path_modules()
+        self._log("critical_path", f"{len(critical_path)} modules", "high" if critical_path else "medium")
+
         domain_overview = self._domain_overview()
+        self._log("domain_overview", f"domains={[d[0] for d in domain_overview]}")
+
         data_sources, data_sinks = self._data_sources_and_sinks()
+        self._log("data_sources_sinks", f"sources={len(data_sources)} sinks={len(data_sinks)}")
+
         known_debt = self._known_debt()
+        scc_count = sum(1 for line in known_debt if line.strip().startswith("- Group"))
+        drift_count = sum(1 for line in known_debt if "docstring differs" in line)
+        self._log("known_debt", f"circular_groups={scc_count} drift_modules={drift_count}")
+
         high_velocity = self._high_velocity_files()
+        self._log("high_velocity", f"{len(high_velocity)} files with commits in last 30d")
 
         lines: list[str] = []
         lines.append(f"# CODEBASE — {self.repo_path.name}")
@@ -115,6 +140,7 @@ class ArchivistAgent:
 
         path.write_text("\n".join(lines), encoding="utf-8")
         logger.info("Archivist: wrote %s", path)
+        self._log("codebase_md_written", f"path={path} lines={len(lines)}")
 
     def _architecture_overview(self) -> str:
         if not self.module_graph:
@@ -225,6 +251,7 @@ class ArchivistAgent:
 
     def _write_onboarding_brief(self) -> None:
         path = self.output_dir / "onboarding_brief.md"
+        self._log("onboarding_brief_start", f"target={path}")
 
         lines: list[str] = []
         lines.append(f"# Onboarding Brief — {self.repo_path.name}")
@@ -241,6 +268,7 @@ class ArchivistAgent:
         )
 
         if isinstance(answers, dict):
+            self._log("onboarding_brief_source", "used day_one_answers from Semanticist/lineage_graph")
             lines.append("### 1. What is the primary data ingestion path?")
             lines.append(answers.get("primary_ingestion_path", "_No answer produced._"))
             lines.append("")
@@ -262,6 +290,7 @@ class ArchivistAgent:
                 lines.append(notes)
                 lines.append("")
         else:
+            self._log("onboarding_brief_source", "scaffold fallback (no day_one_answers)")
             # Fallback scaffold if Semanticist/LLM did not run.
             lines.append("### 1. What is the primary data ingestion path?")
             lines.append("- _To be refined via Semanticist/Navigator; initial hints from data sources in `CODEBASE.md`._")
@@ -284,4 +313,4 @@ class ArchivistAgent:
 
         path.write_text("\n".join(lines), encoding="utf-8")
         logger.info("Archivist: wrote %s", path)
-
+        self._log("onboarding_brief_written", f"path={path} lines={len(lines)}")

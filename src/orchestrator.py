@@ -147,6 +147,7 @@ class Orchestrator:
                 module_graph=self.module_graph,
                 lineage_graph=self.lineage_graph,
                 output_dir=self.output_dir,
+                trace_callback=lambda a, act, d, c: self._log_trace(a, act, d, c),
             )
             archivist.run()
             self._log_trace("archivist", "complete", "Artefacts generated")
